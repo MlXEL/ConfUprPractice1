@@ -1,60 +1,110 @@
+#!/usr/bin/env python3
 import os
 import shlex
 import socket
 import sys
 import re
 import argparse
+import zipfile
+import base64
 
-# Расширяет переменные окружения вида $VAR или ${VAR}
+
+# -------------------------------------------------------------
+# VFS — виртуальная файловая система
+# -------------------------------------------------------------
+class VFS:
+    def __init__(self):
+        self.root = {}          # корень — dict
+        self.cwd = []           # текущий путь в виде списка: ["home", "user"]
+
+    # Добавление файла
+    def add_file(self, path, data):
+        parts = path.split('/')
+        cur = self.root
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = {'type': 'file', 'data': data}
+
+    # Добавление каталогов
+    def add_dir(self, path):
+        parts = path.split('/')
+        cur = self.root
+        for p in parts:
+            cur = cur.setdefault(p, {})
+
+    # Нахождение узла по пути (строка или список)
+    def resolve(self, path):
+        if isinstance(path, str):
+            if path.startswith('/'):
+                parts = path.strip('/').split('/') if path.strip('/') else []
+            else:
+                parts = self.cwd + (path.split('/') if path else [])
+        else:
+            parts = path
+
+        cur = self.root
+        for p in parts:
+            if p == '' or p == '.':
+                continue
+            if p == '..':
+                return None  # запрещаем выход выше root
+            if p not in cur or not isinstance(cur[p], dict):
+                return None
+            cur = cur[p]
+        return cur
+
+    # Переход в каталог
+    def cd(self, path):
+        if path.startswith('/'):
+            parts = path.strip('/').split('/') if path.strip('/') else []
+        else:
+            parts = self.cwd + (path.split('/') if path else [])
+
+        # Проверка
+        cur = self.resolve(parts)
+        if cur is None:
+            return False
+
+        # Проверка, что это каталог (dict, но не файл)
+        if any(k == 'type' for k in cur):
+            return False
+        # Применяем путь
+        self.cwd = [p for p in parts if p]
+        return True
+
+    # Список файлов
+    def ls(self):
+        node = self.resolve([])
+        return list(node.keys()) if node else []
+
+    # Текущий путь
+    def pwd(self):
+        return "/" + "/".join(self.cwd)
+
+
+# -------------------------------------------------------------
+# Утилиты
+# -------------------------------------------------------------
 def expand_env(token):
-    token = token.replace(r'\$', '\0')  # временно пометить экранированные $
+    token = token.replace(r'\$', '\0')
     pattern = re.compile(r'\$(\w+)|\$\{([^}]+)\}')
     def repl(m):
         name = m.group(1) or m.group(2)
         return os.environ.get(name, '')
     result = pattern.sub(repl, token)
-    result = result.replace('\0', '$')
-    return result
+    return result.replace('\0', '$')
 
-# Формирует приглашение вида user@host:cwd$
-# Если передан prompt_override — используем его (может содержать %u %h %d для user, host, cwd)
-def make_prompt(prompt_override=None):
+
+def make_prompt(vfs, prompt_override=None):
     user = os.environ.get('USER') or os.environ.get('USERNAME') or 'user'
     host = socket.gethostname()
-    cwd = os.getcwd()
-    home = os.path.expanduser('~')
-    if cwd.startswith(home):
-        cwd_display = '~' + cwd[len(home):] if cwd != home else '~'
-    else:
-        cwd_display = cwd
+    cwd = vfs.pwd() if vfs else "~"
+
     if prompt_override:
-        # Простая подстановка маркеров
-        return prompt_override.replace('%u', user).replace('%h', host).replace('%d', cwd_display)
-    return f"{user}@{host}:{cwd_display}$ "
+        return prompt_override.replace('%u', user).replace('%h', host).replace('%d', cwd)
+    return f"{user}@{host}:{cwd}$ "
 
-# Обрабатывает одну команду (name и список аргументов)
-# script_mode: если True -> при ошибке возвращаем False чтобы остановить исполнение скрипта
-def handle_command(cmd_name, args, script_mode=False):
-    if cmd_name == '':
-        return True
-    if cmd_name == 'exit':
-        return False
-    if cmd_name in ('ls', 'cd'):
-        print(f"[stub] {cmd_name} {' '.join(args) if args else '(no args)'}")
-        if cmd_name == 'cd' and args:
-            try:
-                os.chdir(args[0])
-            except Exception as e:
-                print(f"cd: {e}")
-                return False if script_mode else True
-        return True
-    # неизвестная команда
-    msg = f"Command not found: {cmd_name}"
-    print(msg)
-    # в режиме скрипта неизвестная команда считается ошибкой
-    return False if script_mode else True
 
-# Парсер строки ввода: разбиваем, расширяем переменные
 def parse_input(line):
     try:
         parts = shlex.split(line)
@@ -66,81 +116,157 @@ def parse_input(line):
         return '', []
     return expanded[0], expanded[1:]
 
-# Выполнение стартового скрипта: останавливается при первой ошибке
-# Каждый выполняемый шаг печатает строку как будто её ввёл пользователь
-def run_startup_script(path, prompt_override):
+
+# -------------------------------------------------------------
+# Загрузка VFS из ZIP
+# -------------------------------------------------------------
+def load_vfs_from_zip(path):
+    v = VFS()
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            for name in z.namelist():
+                if name.endswith('/'):
+                    v.add_dir(name.rstrip('/'))
+                else:
+                    raw = z.read(name)
+                    # Если файл — base64-данные — попробуем декодировать
+                    try:
+                        raw = base64.b64decode(raw)
+                    except Exception:
+                        pass
+                    v.add_file(name, raw)
+        return v
+    except Exception as e:
+        print(f"VFS load error: {e}")
+        return None
+
+
+# -------------------------------------------------------------
+# Обработка команд
+# -------------------------------------------------------------
+def handle_command(cmd, args, vfs, script_mode=False):
+    # exit
+    if cmd == 'exit':
+        return False
+
+    # echo
+    if cmd == 'echo':
+        print(" ".join(args))
+        return True
+
+    # pwd
+    if cmd == 'pwd':
+        print(vfs.pwd())
+        return True
+
+    # ls
+    if cmd == 'ls':
+        node = vfs.resolve(vfs.cwd)
+        print("  ".join(node.keys()))
+        return True
+
+    # cd
+    if cmd == 'cd':
+        if not args:
+            print("cd: missing argument")
+            return False if script_mode else True
+        if not vfs.cd(args[0]):
+            print(f"cd: no such directory: {args[0]}")
+            return False if script_mode else True
+        return True
+
+    # неизвестная команда
+    print(f"Command not found: {cmd}")
+    return False if script_mode else True
+
+
+# -------------------------------------------------------------
+# Выполнение стартового скрипта
+# -------------------------------------------------------------
+def run_startup_script(path, prompt, vfs):
     if not os.path.exists(path):
         print(f"Startup script not found: {path}")
         return False
+
     try:
         with open(path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except Exception as e:
-        print(f"Error reading startup script: {e}")
+        print(f"Script read error: {e}")
         return False
 
-    for raw_line in lines:
-        line = raw_line.rstrip('\n')
-        # строку пустую или комментарий пропускаем (но по условию показываем ввод — покажем всё кроме комментариев)
+    for raw in lines:
+        line = raw.rstrip("\n")
         if line.strip().startswith('#'):
-            # показать комментарий как комментарий скрипта
             print(f"# {line.strip()[1:].strip()}")
             continue
-        # показать как ввод пользователя (prompt + команда)
-        prompt = make_prompt(prompt_override)
-        print(f"{prompt}{line}")
-        name, args = parse_input(line)
-        if name is None:
-            print(f"Error: parse error in startup script at line: {line}")
+
+        print(make_prompt(vfs, prompt) + line)
+        cmd, args = parse_input(line)
+        if cmd is None:
+            print("Script: parse error")
             return False
-        cont = handle_command(name, args, script_mode=True)
-        if not cont:
-            print(f"Error: stopped on command: {name} {(' '.join(args)) if args else ''}")
+
+        ok = handle_command(cmd, args, vfs, script_mode=True)
+        if not ok:
+            print(f"Script stopped at: {line}")
             return False
+
     return True
 
-# Главный REPL
-def repl(prompt_override=None):
+
+# -------------------------------------------------------------
+# REPL
+# -------------------------------------------------------------
+def repl(prompt_override, vfs):
     while True:
         try:
-            prompt = make_prompt(prompt_override)
-            line = input(prompt)
+            line = input(make_prompt(vfs, prompt_override))
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        name, args = parse_input(line)
-        if name is None:
+
+        cmd, args = parse_input(line)
+        if cmd is None:
             continue
-        cont = handle_command(name, args, script_mode=False)
+
+        cont = handle_command(cmd, args, vfs, script_mode=False)
         if not cont:
             break
 
-# Точка входа: парсим параметры и запускаем
+
+# -------------------------------------------------------------
+# main()
+# -------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description='Minimal shell emulator (stage 2)')
-    parser.add_argument('--vfs-path', help='Path to physical VFS (ZIP file)', default=None)
-    parser.add_argument('--prompt', help='Custom prompt (use %u user, %h host, %d cwd)', default=None)
-    parser.add_argument('--startup-script', help='Path to startup script to execute', default=None)
+    parser = argparse.ArgumentParser(description="Shell emulator with VFS (Stage 3)")
+    parser.add_argument("--vfs-path", help="ZIP file containing VFS", required=True)
+    parser.add_argument("--prompt", help="Custom prompt (%u,%h,%d)", default=None)
+    parser.add_argument("--startup-script", help="Script to run before REPL", default=None)
     args = parser.parse_args()
 
-    # Отладочный вывод всех параметров
-    print("Debug: emulator start parameters")
-    print(f"VFS path      : {args.vfs_path}")
-    print(f"Prompt override: {args.prompt}")
-    print(f"Startup script : {args.startup_script}")
-    print("End debug\n")
+    print("=== Debug parameters ===")
+    print("vfs-path:", args.vfs_path)
+    print("prompt  :", args.prompt)
+    print("script  :", args.startup_script)
+    print("========================\n")
 
-    # Если задан стартовый скрипт — выполнить и остановиться если ошибка
+    vfs = load_vfs_from_zip(args.vfs_path)
+    if not vfs:
+        print("Failed to load VFS.")
+        sys.exit(1)
+
+    # Стартовый скрипт
     if args.startup_script:
-        ok = run_startup_script(args.startup_script, args.prompt)
+        ok = run_startup_script(args.startup_script, args.prompt, vfs)
         if not ok:
-            print("Startup script execution failed.")
+            print("Startup script failed.")
             sys.exit(1)
-        else:
-            print("Startup script finished successfully.\n")
+        print("Startup script OK.\n")
 
-    # Запуск интерактивного REPL
-    repl(args.prompt)
+    # REPL
+    repl(args.prompt, vfs)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
