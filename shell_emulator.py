@@ -8,6 +8,8 @@ import argparse
 import zipfile
 import base64
 
+# --- ХРАНЕНИЕ ИСТОРИИ ---
+command_history = []
 
 # -------------------------------------------------------------
 # VFS — виртуальная файловая система
@@ -32,22 +34,25 @@ class VFS:
         for p in parts:
             cur = cur.setdefault(p, {})
 
-    # Нахождение узла по пути (строка или список)
+    # Нахождение узла по пути (теперь всегда абсолютный путь от корня)
     def resolve(self, path):
         if isinstance(path, str):
+            # Если строка, она должна быть абсолютной
             if path.startswith('/'):
                 parts = path.strip('/').split('/') if path.strip('/') else []
             else:
-                parts = self.cwd + (path.split('/') if path else [])
+                # Относительный путь не поддерживается в resolve, только абсолютный
+                # Для текущего пути используем self.cwd
+                raise ValueError("Use resolve([]) for current path or pass absolute path list.")
         else:
+            # Предполагаем, что это список (абсолютный путь от корня)
             parts = path
 
         cur = self.root
         for p in parts:
             if p == '' or p == '.':
                 continue
-            if p == '..':
-                return None  # запрещаем выход выше root
+            # .. не обрабатывается здесь
             if p not in cur or not isinstance(cur[p], dict):
                 return None
             cur = cur[p]
@@ -55,26 +60,48 @@ class VFS:
 
     # Переход в каталог
     def cd(self, path):
+        # --- ИСПРАВЛЕНИЕ CD: Обработка относительного и абсолютного пути ---
         if path.startswith('/'):
-            parts = path.strip('/').split('/') if path.strip('/') else []
+            new_parts = path.strip('/').split('/') if path.strip('/') else []
         else:
-            parts = self.cwd + (path.split('/') if path else [])
+            # Относительный путь: добавляем к текущему
+            new_parts = self.cwd + (path.split('/') if path else [])
 
-        # Проверка
-        cur = self.resolve(parts)
-        if cur is None:
+        # --- ИСПРАВЛЕНИЕ CD: Обработка . и .. ---
+        resolved_cwd = []
+        for part in new_parts:
+            if part == '.' or part == '':
+                continue
+            elif part == '..':
+                if resolved_cwd:
+                    resolved_cwd.pop()
+                # else: уже на вершине, остаёмся на месте
+            else:
+                resolved_cwd.append(part)
+
+        # --- ИСПРАВЛЕНИЕ CD: Проверка, что путь существует и это каталог ---
+        target_node = self.resolve(resolved_cwd)
+        if target_node is None:
+            # Путь не существует
+            return False
+        if 'type' in target_node and target_node['type'] == 'file':
+            # Это файл, а не каталог
             return False
 
-        # Проверка, что это каталог (dict, но не файл)
-        if any(k == 'type' for k in cur):
-            return False
         # Применяем путь
-        self.cwd = [p for p in parts if p]
+        self.cwd = resolved_cwd
         return True
+
 
     # Список файлов
     def ls(self):
-        node = self.resolve([])
+        node = self.resolve(self.cwd) # Используем текущий путь как абсолютный
+        if node is None:
+            return []
+        # Проверяем, что это каталог, а не файл
+        if 'type' in node and node['type'] == 'file':
+            print("ls: not a directory")
+            return []
         return list(node.keys()) if node else []
 
     # Текущий путь
@@ -145,6 +172,8 @@ def load_vfs_from_zip(path):
 # Обработка команд
 # -------------------------------------------------------------
 def handle_command(cmd, args, vfs, script_mode=False):
+    global command_history # Для доступа к глобальной истории
+
     # exit
     if cmd == 'exit':
         return False
@@ -161,8 +190,10 @@ def handle_command(cmd, args, vfs, script_mode=False):
 
     # ls
     if cmd == 'ls':
-        node = vfs.resolve(vfs.cwd)
-        print("  ".join(node.keys()))
+        items = vfs.ls()
+        # Вывод уже производится в ls, если это файл
+        if items: # Только если список не пустой (и не None)
+            print("  ".join(items))
         return True
 
     # cd
@@ -173,6 +204,47 @@ def handle_command(cmd, args, vfs, script_mode=False):
         if not vfs.cd(args[0]):
             print(f"cd: no such directory: {args[0]}")
             return False if script_mode else True
+        return True
+
+    # find
+    if cmd == 'find':
+        if not args:
+            print("find: missing argument")
+            return False if script_mode else True
+        search_name = args[0]
+
+        results = []
+        def find_recursive(node, current_path):
+            for key, value in node.items():
+                full_path = current_path + '/' + key if current_path else key
+                if key == search_name:
+                    results.append(full_path)
+                if isinstance(value, dict) and 'type' not in value:
+                    find_recursive(value, full_path)
+
+        find_recursive(vfs.root, '')
+        for res in results:
+            print(res)
+        return True
+
+    # history
+    if cmd == 'history':
+        for i, entry in enumerate(command_history, 1):
+            print(f"{i:3}: {entry}")
+        return True
+
+    # help
+    if cmd == 'help':
+        print("Available commands:")
+        print("  exit")
+        print("  echo <arg>")
+        print("  pwd")
+        print("  ls")
+        print("  cd <path>")
+        print(" cd .. (возврат)")
+        print("  find <file_or_catalog>")
+        print("  history")
+        print("  help")
         return True
 
     # неизвестная команда
@@ -207,6 +279,9 @@ def run_startup_script(path, prompt, vfs):
             print("Script: parse error")
             return False
 
+        # --- ДОБАВЛЕНО: Сохранение команды в историю ---
+        command_history.append(line)
+
         ok = handle_command(cmd, args, vfs, script_mode=True)
         if not ok:
             print(f"Script stopped at: {line}")
@@ -230,6 +305,9 @@ def repl(prompt_override, vfs):
         if cmd is None:
             continue
 
+        # --- ДОБАВЛЕНО: Сохранение команды в историю ---
+        command_history.append(line)
+
         cont = handle_command(cmd, args, vfs, script_mode=False)
         if not cont:
             break
@@ -239,7 +317,7 @@ def repl(prompt_override, vfs):
 # main()
 # -------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Shell emulator with VFS (Stage 3)")
+    parser = argparse.ArgumentParser(description="Shell emulator with VFS (Stage 4)")
     parser.add_argument("--vfs-path", help="ZIP file containing VFS", required=True)
     parser.add_argument("--prompt", help="Custom prompt (%u,%h,%d)", default=None)
     parser.add_argument("--startup-script", help="Script to run before REPL", default=None)
